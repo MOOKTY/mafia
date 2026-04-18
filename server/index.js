@@ -12,42 +12,39 @@ const registerSocketHandlers = require('./socketHandlers');
 
 const PORT = process.env.PORT || 3000;
 
-// ── Express setup ─────────────────────────────────────────────────────────
 const app = express();
 const server = http.createServer(app);
 
-// Serve static frontend files
-app.use(express.static(path.join(__dirname, '../public')));
+// Serve static frontend files from /public
+app.use(express.static(path.join(__dirname, '..', 'public')));
 
-// Health check endpoint
-app.get('/health', (req, res) => res.json({ status: 'ok', timestamp: Date.now() }));
-
-// Fallback for SPA
-app.get('*', (req, res) => {
-  res.sendFile(path.join(__dirname, '../public/index.html'));
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: Date.now() });
 });
 
-// ── Socket.io setup ───────────────────────────────────────────────────────
+// Home page
+app.get('/', (req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
+});
+
+// Optional: only fallback for non-file routes
+app.get(/^\/(?!css\/|js\/|socket\.io\/).*/, (req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'public', 'index.html'));
+});
+
 const io = new Server(server, {
   cors: {
     origin: '*',
     methods: ['GET', 'POST'],
   },
-  // Ping settings for detecting disconnects faster
   pingTimeout: 10000,
   pingInterval: 5000,
 });
 
-// ── Wire everything together ──────────────────────────────────────────────
 const roomManager = new RoomManager(io);
 registerSocketHandlers(io, roomManager);
 
-// ── Start server ──────────────────────────────────────────────────────────
 server.listen(PORT, () => {
-  console.log(`
-  ╔══════════════════════════════════════╗
-  ║   🎭  Mafia Game Server Running      ║
-  ║   http://localhost:${PORT}              ║
-  ╚══════════════════════════════════════╝
-  `);
+  console.log(`Mafia Game Server running on port ${PORT}`);
 });
