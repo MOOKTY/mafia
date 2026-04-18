@@ -1,445 +1,503 @@
 /**
- * game.js — Main game client module.
- * Manages local game state, socket events, and bridges UI ↔ Server.
- *
- * Architecture:
- *   game.js   → orchestrates state + socket events
- *   ui.js     → all DOM rendering
- *   timer.js  → countdown timer logic
+ * Game.js — Core game state manager
+ * Separates all game logic from socket/transport layer.
+ * The Game class is pure logic; sockets just call its methods.
  */
 
-const GameClient = (() => {
+const { v4: uuidv4 } = require('uuid');
 
-  // ── Local state ──────────────────────────────────────────────────────────
+// ── Role constants ──────────────────────────────────────────────────────────
+const ROLES = {
+  MAFIA: 'mafia',
+  CITIZEN: 'citizen',
+  DOCTOR: 'doctor',
+  POLICE: 'police',
+};
 
-  let socket = null;
-  let state = {
-    roomId: null,
-    myId: null,
-    myRole: null,
-    myName: null,
-    isHost: false,
-    phase: 'lobby',
-    round: 0,
-    players: [],
-    settings: {},
-    mafiaTeam: null,       // only populated for mafia players
-    nightPrompt: null,     // { action, targets }
-    nightActionDone: false,
-    voteCast: null,        // targetId or null
-    gameLog: [],
-    chatMode: 'public',    // 'public' | 'mafia'
-  };
+// ── Phase constants ─────────────────────────────────────────────────────────
+const PHASES = {
+  LOBBY: 'lobby',
+  NIGHT: 'night',
+  DAY_ANNOUNCE: 'day_announce',
+  DAY_DISCUSS: 'day_discuss',
+  DAY_VOTE: 'day_vote',
+  GAME_OVER: 'game_over',
+};
 
-  // ── Init ──────────────────────────────────────────────────────────────────
+// ── Timer durations (ms) ────────────────────────────────────────────────────
+const TIMERS = {
+  NIGHT: 45000,
+  DAY_ANNOUNCE: 8000,
+  DAY_DISCUSS: 60000,
+  DAY_VOTE: 30000,
+};
 
-  function init() {
-    socket = io();
-    _bindSocketEvents();
-    _bindUIEvents();
-    _bindHomeEvents();
-    console.log('[GameClient] Initialized');
-  }
+class Game {
+  constructor(roomId, settings) {
+    this.roomId = roomId;
+    this.settings = settings; // { totalPlayers, mafiaCount, doctorEnabled, policeEnabled }
+    this.players = new Map(); // socketId → PlayerObj
+    this.phase = PHASES.LOBBY;
+    this.round = 0;
 
-  // ── Home screen events ────────────────────────────────────────────────────
-
-  function _bindHomeEvents() {
-    // Live role summary preview
-    const updateSummary = () => {
-      const total  = parseInt(document.getElementById('setting-total').value) || 0;
-      const mafia  = parseInt(document.getElementById('setting-mafia').value) || 0;
-      const doctor = document.getElementById('setting-doctor').checked;
-      const police = document.getElementById('setting-police').checked;
-      UI.updateRoleSummary(total, mafia, doctor, police);
+    // Night action storage (reset each round)
+    this.nightActions = {
+      mafiaTarget: null,   // socketId
+      doctorTarget: null,  // socketId
+      policeTarget: null,  // socketId
+      mafiaVotes: {},      // socketId → targetId (for consensus)
     };
-    ['setting-total','setting-mafia','setting-doctor','setting-police'].forEach(id => {
-      document.getElementById(id).addEventListener('change', updateSummary);
-      document.getElementById(id).addEventListener('input', updateSummary);
-    });
-    updateSummary();
 
-    // Create room
-    document.getElementById('btn-create').addEventListener('click', () => {
-      const name = document.getElementById('create-name').value.trim();
-      const settings = {
-        totalPlayers:  parseInt(document.getElementById('setting-total').value),
-        mafiaCount:    parseInt(document.getElementById('setting-mafia').value),
-        doctorEnabled: document.getElementById('setting-doctor').checked,
-        policeEnabled: document.getElementById('setting-police').checked,
-      };
-      if (!name) {
-        document.getElementById('create-error').textContent = 'Enter your name.';
-        return;
-      }
-      document.getElementById('create-error').textContent = '';
-      socket.emit('createRoom', { settings, playerName: name }, (res) => {
-        if (res.error) {
-          document.getElementById('create-error').textContent = res.error;
-          return;
-        }
-        _onJoinedRoom(res);
-      });
-    });
+    // Voting storage
+    this.votes = {};       // voterId → targetId
+    this.voteResult = null;
 
-    // Join room
-    document.getElementById('btn-join').addEventListener('click', () => {
-      const name = document.getElementById('join-name').value.trim();
-      const code = document.getElementById('join-code').value.trim().toUpperCase();
-      if (!name) { document.getElementById('join-error').textContent = 'Enter your name.'; return; }
-      if (code.length !== 6) { document.getElementById('join-error').textContent = 'Enter a valid 6-character room code.'; return; }
-      document.getElementById('join-error').textContent = '';
-      socket.emit('joinRoom', { roomId: code, playerName: name }, (res) => {
-        if (res.error) {
-          document.getElementById('join-error').textContent = res.error;
-          return;
-        }
-        _onJoinedRoom(res);
-      });
-    });
+    // Game log (public-safe events only)
+    this.log = [];
 
-    // Enter key shortcuts
-    document.getElementById('join-code').addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('btn-join').click(); });
-    document.getElementById('create-name').addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('btn-create').click(); });
-    document.getElementById('join-name').addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('btn-join').click(); });
+    // Active timer reference (for cleanup)
+    this._timer = null;
+    this._timerStart = null;
+    this._timerDuration = null;
+
+    // Callback set by room manager to broadcast events
+    this.onEvent = null; // fn(eventName, data, filter?)
   }
 
-  function _onJoinedRoom(res) {
-    state.roomId  = res.roomId;
-    state.myId    = res.player.id;
-    state.myName  = res.player.name;
-    state.isHost  = res.player.isHost;
-    state.players = res.players;
-    state.settings = res.settings;
+  // ── Player management ─────────────────────────────────────────────────────
 
-    UI.showScreen('screen-game');
-    UI.updatePhaseBadge('lobby');
-    UI.updateMyRoleBadge(null);
-    UI.renderPlayers(state.players, state.myId, null);
-    _renderCurrentPhase();
+  addPlayer(socketId, name) {
+    if (this.phase !== PHASES.LOBBY) return { error: 'Game already started' };
+    if (this.players.size >= this.settings.totalPlayers) return { error: 'Room full' };
+    if ([...this.players.values()].some(p => p.name === name)) {
+      return { error: 'Name already taken' };
+    }
+    const player = {
+      id: socketId,
+      name,
+      role: null,
+      alive: true,
+      isHost: this.players.size === 0, // first player is host
+    };
+    this.players.set(socketId, player);
+    return { player };
   }
 
-  // ── Socket event bindings ─────────────────────────────────────────────────
-
-  function _bindSocketEvents() {
-
-    // Another player joined
-    socket.on('playerJoined', ({ players }) => {
-      state.players = players;
-      UI.renderPlayers(state.players, state.myId, state.myRole);
-      _renderCurrentPhase();
-      UI.appendChatMessage({ type: 'system', message: `${players[players.length - 1]?.name || 'Someone'} joined the room.` }, state.myId);
-    });
-
-    // A player left
-    socket.on('playerLeft', ({ players, playerName }) => {
-      state.players = players;
-      UI.renderPlayers(state.players, state.myId, state.myRole);
-      UI.appendChatMessage({ type: 'system', message: `${playerName} left the room.` }, state.myId);
-      if (state.phase === 'lobby') _renderCurrentPhase();
-    });
-
-    // Role assigned (private)
-    socket.on('roleAssigned', ({ role, mafiaTeam }) => {
-      state.myRole = role;
-      state.mafiaTeam = mafiaTeam;
-      UI.updateMyRoleBadge(role);
-      if (role === 'mafia') UI.showMafiaChatTab(true);
-      // Show a private toast
-      const roleMessages = {
-        mafia:   '🔴 You are MAFIA. Eliminate the citizens.',
-        citizen: '🔵 You are a CITIZEN. Find the mafia!',
-        doctor:  '🟢 You are the DOCTOR. Save lives each night.',
-        police:  '🟡 You are the POLICE. Investigate suspects.',
-      };
-      UI.toast(roleMessages[role] || 'Role assigned', role === 'mafia' ? 'error' : 'success', 5000);
-    });
-
-    // Generic phase change
-    socket.on('phaseChange', (data) => {
-      state.phase  = data.phase;
-      state.round  = data.round || state.round;
-      UI.updatePhaseBadge(state.phase);
-      UI.updateRound(state.round);
-
-      if (data.duration) {
-        Timer.start(data.duration, UI.updateTimer, UI.hideTimer);
-      }
-
-      if (data.phase === 'night') {
-        state.nightActionDone = false;
-        state.nightPrompt = null;
-        UI.renderNightPhase(state.myRole, state.mafiaTeam, null, state.myId, false);
-        _updateChatState();
-      } else if (data.phase === 'day_discuss') {
-        UI.renderDiscussPhase();
-        _updateChatState();
-        UI.appendLog(state.gameLog);
-      } else if (data.phase === 'day_vote') {
-        state.voteCast = null;
-        const myPlayer = state.players.find(p => p.id === state.myId);
-        UI.renderVotingPhase(data.targets || [], state.myId, myPlayer?.alive, null);
-        _updateChatState();
-        UI.appendLog(state.gameLog);
-      }
-    });
-
-    // Night prompts for roles
-    socket.on('nightPrompt', (prompt) => {
-      state.nightPrompt = prompt;
-      UI.renderNightPhase(state.myRole, state.mafiaTeam, prompt, state.myId, state.nightActionDone);
-      UI.appendLog(state.gameLog);
-    });
-
-    // Police investigation result (private)
-    socket.on('policeResult', ({ targetName, result }) => {
-      UI.toast(`🔍 Investigation: ${targetName} is ${result}`, result === 'Mafia' ? 'error' : 'success', 6000);
-      state.nightActionDone = true;
-      UI.renderNightPhase(state.myRole, state.mafiaTeam, null, state.myId, true);
-    });
-
-    // Night resolved → day announce
-    socket.on('nightResolution', (data) => {
-      state.phase = data.phase; // day_announce
-      state.round = data.round;
-      if (data.players) {
-        state.players = data.players;
-        UI.renderPlayers(state.players, state.myId, state.myRole);
-      }
-      UI.updatePhaseBadge('day_announce');
-      UI.updateRound(state.round);
-      if (data.duration) {
-        Timer.start(data.duration, UI.updateTimer, UI.hideTimer);
-      }
-      UI.renderDayAnnounce(data.killed, data.saved);
-      UI.appendLog(state.gameLog);
-      _updateChatState();
-    });
-
-    // Vote progress update
-    socket.on('voteUpdate', ({ voteCount }) => {
-      const total = state.players.filter(p => p.alive).length;
-      const el = document.getElementById('vote-counter');
-      if (el) el.textContent = `${voteCount} / ${total} votes cast`;
-    });
-
-    // Vote resolved
-    socket.on('voteResult', (data) => {
-      if (data.players) {
-        state.players = data.players;
-        UI.renderPlayers(state.players, state.myId, state.myRole);
-      }
-      UI.renderVoteResult(data);
-      UI.appendLog(state.gameLog);
-    });
-
-    // Game over
-    socket.on('gameOver', (data) => {
-      state.phase = 'game_over';
-      Timer.stop();
-      UI.hideTimer();
-      UI.updatePhaseBadge('game_over');
-      state.gameLog = data.log || state.gameLog;
-      UI.renderGameOver(data);
-      UI.appendLog(state.gameLog);
-      UI.showRestartButton(state.isHost);
-      UI.setChatEnabled(false, 'Game over');
-
-      const winMsg = data.winner === 'mafia' ? '🔴 Mafia wins!' : '🟢 Citizens win!';
-      UI.toast(winMsg, data.winner === 'mafia' ? 'error' : 'success', 8000);
-    });
-
-    // Game restarted
-    socket.on('gameRestarted', ({ players, settings }) => {
-      state.phase = 'lobby';
-      state.round = 0;
-      state.myRole = null;
-      state.mafiaTeam = null;
-      state.nightPrompt = null;
-      state.nightActionDone = false;
-      state.voteCast = null;
-      state.gameLog = [];
-      state.settings = settings;
-      state.players = players;
-
-      // Reset host status from player list
-      const me = players.find(p => p.id === state.myId);
-      if (me) state.isHost = me.isHost;
-
-      Timer.stop();
-      UI.hideTimer();
-      UI.updatePhaseBadge('lobby');
-      UI.updateRound(0);
-      UI.updateMyRoleBadge(null);
-      UI.showMafiaChatTab(false);
-      UI.renderPlayers(state.players, state.myId, null);
-      _renderCurrentPhase();
-      UI.appendChatMessage({ type: 'system', message: '🔄 Game restarted. Waiting for host to start...' }, state.myId);
-      _updateChatState();
-    });
-
-    // Chat messages
-    socket.on('chatMessage', (msg) => {
-      UI.appendChatMessage(msg, state.myId);
-    });
-
-    socket.on('chatError', ({ error }) => {
-      UI.toast(error, 'error');
-    });
-
-    socket.on('disconnect', () => {
-      UI.toast('Disconnected from server. Refresh to reconnect.', 'error', 8000);
-    });
-
-    socket.on('reconnect', () => {
-      UI.toast('Reconnected!', 'success');
-    });
+  removePlayer(socketId) {
+    const player = this.players.get(socketId);
+    if (!player) return;
+    this.players.delete(socketId);
+    // If host left and game is in lobby, transfer host
+    if (player.isHost && this.phase === PHASES.LOBBY && this.players.size > 0) {
+      const newHost = this.players.values().next().value;
+      newHost.isHost = true;
+    }
+    return player;
   }
 
-  // ── UI event bindings (game screen) ──────────────────────────────────────
+  getPublicPlayers() {
+    // Safe player list — no role info leaked to wrong players
+    return [...this.players.values()].map(p => ({
+      id: p.id,
+      name: p.name,
+      alive: p.alive,
+      isHost: p.isHost,
+    }));
+  }
 
-  function _bindUIEvents() {
-    // Start game button (delegated — rendered dynamically)
-    document.getElementById('game-main').addEventListener('click', (e) => {
-      if (e.target.id === 'btn-start-game') {
-        socket.emit('startGame', {}, (res) => {
-          if (res?.error) UI.toast(res.error, 'error');
+  getPlayerById(socketId) {
+    return this.players.get(socketId);
+  }
+
+  // ── Game start ────────────────────────────────────────────────────────────
+
+  startGame() {
+    const playerCount = this.players.size;
+    if (playerCount < 3) return { error: 'Need at least 3 players' };
+    if (playerCount !== this.settings.totalPlayers) {
+      return { error: `Need exactly ${this.settings.totalPlayers} players` };
+    }
+
+    this._assignRoles();
+    this.round = 1;
+    this._addLog(`Game started with ${playerCount} players.`);
+    this._startNightPhase();
+    return { ok: true };
+  }
+
+  _assignRoles() {
+    const playerIds = [...this.players.keys()];
+    // Shuffle
+    for (let i = playerIds.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [playerIds[i], playerIds[j]] = [playerIds[j], playerIds[i]];
+    }
+
+    let idx = 0;
+    // Assign mafia
+    for (let i = 0; i < this.settings.mafiaCount; i++) {
+      this.players.get(playerIds[idx++]).role = ROLES.MAFIA;
+    }
+    // Assign doctor if enabled
+    if (this.settings.doctorEnabled) {
+      this.players.get(playerIds[idx++]).role = ROLES.DOCTOR;
+    }
+    // Assign police if enabled
+    if (this.settings.policeEnabled) {
+      this.players.get(playerIds[idx++]).role = ROLES.POLICE;
+    }
+    // Rest are citizens
+    while (idx < playerIds.length) {
+      this.players.get(playerIds[idx++]).role = ROLES.CITIZEN;
+    }
+  }
+
+  // ── Phase transitions ─────────────────────────────────────────────────────
+
+  _startNightPhase() {
+    this.phase = PHASES.NIGHT;
+    this._resetNightActions();
+    this._addLog(`🌙 Night ${this.round} begins.`);
+    this._emit('phaseChange', {
+      phase: PHASES.NIGHT,
+      round: this.round,
+      duration: TIMERS.NIGHT,
+    });
+    // Send role-specific night prompts
+    this._emitNightPrompts();
+    this._startTimer(TIMERS.NIGHT, () => this._resolveNight());
+  }
+
+  _emitNightPrompts() {
+    for (const [sid, player] of this.players) {
+      if (!player.alive) continue;
+      if (player.role === ROLES.MAFIA) {
+        const targets = this._getAlivePlayers().filter(p => p.role !== ROLES.MAFIA);
+        this._emitTo(sid, 'nightPrompt', {
+          action: 'kill',
+          targets: targets.map(p => ({ id: p.id, name: p.name })),
+        });
+      } else if (player.role === ROLES.DOCTOR && this.settings.doctorEnabled) {
+        const targets = this._getAlivePlayers();
+        this._emitTo(sid, 'nightPrompt', {
+          action: 'protect',
+          targets: targets.map(p => ({ id: p.id, name: p.name })),
+        });
+      } else if (player.role === ROLES.POLICE && this.settings.policeEnabled) {
+        const targets = this._getAlivePlayers().filter(p => p.id !== sid);
+        this._emitTo(sid, 'nightPrompt', {
+          action: 'investigate',
+          targets: targets.map(p => ({ id: p.id, name: p.name })),
         });
       }
-    });
-
-    // Chat send
-    document.getElementById('chat-send').addEventListener('click', sendChat);
-    document.getElementById('chat-input').addEventListener('keydown', (e) => {
-      if (e.key === 'Enter') sendChat();
-    });
-
-    // Chat tab toggle
-    document.getElementById('chat-tab-public').addEventListener('click', () => {
-      state.chatMode = 'public';
-      document.getElementById('chat-tab-public').classList.add('active');
-      document.getElementById('chat-tab-mafia').classList.remove('active');
-      _updateChatState();
-    });
-    document.getElementById('chat-tab-mafia').addEventListener('click', () => {
-      state.chatMode = 'mafia';
-      document.getElementById('chat-tab-mafia').classList.add('active');
-      document.getElementById('chat-tab-public').classList.remove('active');
-      _updateChatState();
-    });
-
-    // Restart modal
-    document.getElementById('btn-cancel-restart').addEventListener('click', UI.hideRestartModal);
-    document.getElementById('btn-confirm-restart').addEventListener('click', () => {
-      const newSettings = UI.getRestartSettings();
-      socket.emit('restartGame', { newSettings }, (res) => {
-        if (res?.error) { UI.toast(res.error, 'error'); return; }
-        UI.hideRestartModal();
-      });
-    });
-    ['restart-total','restart-mafia','restart-doctor','restart-police'].forEach(id => {
-      document.getElementById(id).addEventListener('change', UI.updateRestartSummary);
-      document.getElementById(id).addEventListener('input', UI.updateRestartSummary);
-    });
+    }
   }
 
-  // ── Night action ──────────────────────────────────────────────────────────
+  submitNightAction(socketId, action, targetId) {
+    const player = this.players.get(socketId);
+    if (!player || !player.alive) return { error: 'Invalid player' };
+    if (this.phase !== PHASES.NIGHT) return { error: 'Not night phase' };
+    const target = this.players.get(targetId);
+    if (!target || !target.alive) return { error: 'Invalid target' };
 
-  function submitNightAction(action, targetId, btn) {
-    if (state.nightActionDone) return;
-    socket.emit('nightAction', { action, targetId }, (res) => {
-      if (res?.error) { UI.toast(res.error, 'error'); return; }
-      state.nightActionDone = true;
-      // Visual feedback on button
-      document.querySelectorAll('.target-btn').forEach(b => b.disabled = true);
-      if (btn) btn.classList.add('selected');
-      // Show submitted state
-      const grid = document.getElementById('target-grid');
-      if (grid) {
-        grid.insertAdjacentHTML('afterend', '<div class="action-submitted">✓ Action submitted. Waiting for other players...</div>');
+    if (player.role === ROLES.MAFIA && action === 'kill') {
+      // Majority vote — track per-mafia vote, last vote wins for simplicity
+      this.nightActions.mafiaVotes[socketId] = targetId;
+      // Use the most-voted target (or last if tie)
+      this.nightActions.mafiaTarget = this._getMafiaConsensus();
+      return { ok: true };
+    }
+    if (player.role === ROLES.DOCTOR && action === 'protect') {
+      this.nightActions.doctorTarget = targetId;
+      return { ok: true };
+    }
+    if (player.role === ROLES.POLICE && action === 'investigate') {
+      this.nightActions.policeTarget = targetId;
+      const result = target.role === ROLES.MAFIA ? 'Mafia' : 'Not Mafia';
+      // Send result only to police player
+      this._emitTo(socketId, 'policeResult', { targetName: target.name, result });
+      this._addLog(`🔍 Police investigated a player.`); // public log hides result
+      return { ok: true, result };
+    }
+    return { error: 'Invalid action' };
+  }
+
+  _getMafiaConsensus() {
+    const votes = Object.values(this.nightActions.mafiaVotes);
+    if (votes.length === 0) return null;
+    const freq = {};
+    let maxV = 0, winner = null;
+    for (const v of votes) {
+      freq[v] = (freq[v] || 0) + 1;
+      if (freq[v] > maxV) { maxV = freq[v]; winner = v; }
+    }
+    return winner;
+  }
+
+  _resolveNight() {
+    this._clearTimer();
+    const { mafiaTarget, doctorTarget } = this.nightActions;
+    let killed = null;
+    let saved = false;
+
+    if (mafiaTarget) {
+      if (mafiaTarget === doctorTarget) {
+        saved = true;
+        this._addLog(`🛡️ Someone was targeted but saved by the Doctor.`);
+      } else {
+        const victim = this.players.get(mafiaTarget);
+        if (victim && victim.alive) {
+          victim.alive = false;
+          killed = { id: victim.id, name: victim.name };
+          this._addLog(`💀 ${victim.name} was eliminated during the night.`);
+        }
       }
+    } else {
+      this._addLog(`😴 A quiet night — no one was eliminated.`);
+    }
+
+    const winner = this._checkWinCondition();
+    if (winner) {
+      this._endGame(winner);
+      return;
+    }
+
+    // Transition to day announcement
+    this.phase = PHASES.DAY_ANNOUNCE;
+    this._emit('nightResolution', {
+      phase: PHASES.DAY_ANNOUNCE,
+      killed,
+      saved: saved && !killed,
+      round: this.round,
+      duration: TIMERS.DAY_ANNOUNCE,
+      players: this.getPublicPlayers(),
     });
+    this._addLog(`☀️ Day ${this.round} begins.`);
+    this._startTimer(TIMERS.DAY_ANNOUNCE, () => this._startDiscussPhase());
   }
 
-  // ── Vote ──────────────────────────────────────────────────────────────────
-
-  function castVote(targetId, btn) {
-    if (state.voteCast) return;
-    socket.emit('castVote', { targetId }, (res) => {
-      if (res?.error) { UI.toast(res.error, 'error'); return; }
-      state.voteCast = targetId;
-      document.querySelectorAll('.target-btn').forEach(b => b.disabled = true);
-      if (btn) btn.classList.add('selected');
+  _startDiscussPhase() {
+    this.phase = PHASES.DAY_DISCUSS;
+    this._emit('phaseChange', {
+      phase: PHASES.DAY_DISCUSS,
+      round: this.round,
+      duration: TIMERS.DAY_DISCUSS,
     });
+    this._startTimer(TIMERS.DAY_DISCUSS, () => this._startVotingPhase());
+  }
+
+  _startVotingPhase() {
+    this.phase = PHASES.DAY_VOTE;
+    this.votes = {};
+    const targets = this._getAlivePlayers();
+    this._emit('phaseChange', {
+      phase: PHASES.DAY_VOTE,
+      round: this.round,
+      duration: TIMERS.DAY_VOTE,
+      targets: targets.map(p => ({ id: p.id, name: p.name })),
+    });
+    this._addLog(`🗳️ Voting phase started.`);
+    this._startTimer(TIMERS.DAY_VOTE, () => this._resolveVote());
+  }
+
+  submitVote(socketId, targetId) {
+    const voter = this.players.get(socketId);
+    if (!voter || !voter.alive) return { error: 'Dead players cannot vote' };
+    if (this.phase !== PHASES.DAY_VOTE) return { error: 'Not voting phase' };
+    const target = this.players.get(targetId);
+    if (!target || !target.alive) return { error: 'Invalid target' };
+    if (socketId === targetId) return { error: 'Cannot vote for yourself' };
+
+    this.votes[socketId] = targetId;
+
+    // Broadcast updated vote counts (without showing who voted for whom)
+    this._emit('voteUpdate', { voteCount: Object.keys(this.votes).length });
+
+    // Auto-resolve if everyone alive has voted
+    const aliveCount = this._getAlivePlayers().length;
+    if (Object.keys(this.votes).length >= aliveCount) {
+      this._clearTimer();
+      this._resolveVote();
+    }
+    return { ok: true };
+  }
+
+  _resolveVote() {
+    this._clearTimer();
+    // Tally votes
+    const tally = {};
+    for (const targetId of Object.values(this.votes)) {
+      tally[targetId] = (tally[targetId] || 0) + 1;
+    }
+
+    let maxVotes = 0;
+    let eliminated = null;
+    let tie = false;
+
+    for (const [pid, count] of Object.entries(tally)) {
+      if (count > maxVotes) {
+        maxVotes = count;
+        eliminated = pid;
+        tie = false;
+      } else if (count === maxVotes) {
+        tie = true;
+      }
+    }
+
+    if (tie || !eliminated) {
+      this._addLog(`🤷 The vote ended in a tie — no one was eliminated.`);
+      this._emit('voteResult', { eliminated: null, tie: true, tally: this._safeTally(tally) });
+    } else {
+      const victim = this.players.get(eliminated);
+      if (victim) {
+        victim.alive = false;
+        this._addLog(`⚖️ ${victim.name} was voted out. They were a ${victim.role}.`);
+        this._emit('voteResult', {
+          eliminated: { id: victim.id, name: victim.name, role: victim.role },
+          tie: false,
+          tally: this._safeTally(tally),
+          players: this.getPublicPlayers(),
+        });
+      }
+    }
+
+    const winner = this._checkWinCondition();
+    if (winner) {
+      setTimeout(() => this._endGame(winner), 3000);
+      return;
+    }
+
+    this.round++;
+    setTimeout(() => this._startNightPhase(), 4000);
+  }
+
+  _safeTally(tally) {
+    // Map IDs to names for display
+    const out = {};
+    for (const [pid, count] of Object.entries(tally)) {
+      const p = this.players.get(pid);
+      if (p) out[p.name] = count;
+    }
+    return out;
+  }
+
+  // ── Win condition ─────────────────────────────────────────────────────────
+
+  _checkWinCondition() {
+    const alive = this._getAlivePlayers();
+    const aliveMafia = alive.filter(p => p.role === ROLES.MAFIA).length;
+    const aliveOthers = alive.filter(p => p.role !== ROLES.MAFIA).length;
+
+    if (aliveMafia === 0) return 'citizens';
+    if (aliveMafia >= aliveOthers) return 'mafia';
+    return null;
+  }
+
+  _endGame(winner) {
+    this._clearTimer();
+    this.phase = PHASES.GAME_OVER;
+    const winnerText = winner === 'mafia' ? '🔴 Mafia wins!' : '🟢 Citizens win!';
+    this._addLog(`🏆 Game over — ${winnerText}`);
+
+    // Reveal all roles
+    const roleReveal = [...this.players.values()].map(p => ({
+      id: p.id,
+      name: p.name,
+      role: p.role,
+      alive: p.alive,
+    }));
+
+    this._emit('gameOver', { winner, winnerText, roleReveal, log: this.log });
+  }
+
+  // ── Restart ───────────────────────────────────────────────────────────────
+
+  restart(newSettings) {
+    this._clearTimer();
+    if (newSettings) this.settings = newSettings;
+    this.phase = PHASES.LOBBY;
+    this.round = 0;
+    this.votes = {};
+    this.log = [];
+    this._resetNightActions();
+    // Reset player states but keep them in the room
+    for (const p of this.players.values()) {
+      p.role = null;
+      p.alive = true;
+    }
+    this._emit('gameRestarted', {
+      players: this.getPublicPlayers(),
+      settings: this.settings,
+    });
+    return { ok: true };
   }
 
   // ── Chat ──────────────────────────────────────────────────────────────────
 
-  function sendChat() {
-    const input = document.getElementById('chat-input');
-    const msg = input.value.trim();
-    if (!msg) return;
-    input.value = '';
+  sendChat(socketId, message) {
+    const player = this.players.get(socketId);
+    if (!player) return { error: 'Unknown player' };
+    if (!player.alive) return { error: 'Dead players cannot chat publicly' };
+    if (this.phase === PHASES.NIGHT || this.phase === PHASES.LOBBY) {
+      return { error: 'Public chat only during day phases' };
+    }
+    return { ok: true, player };
+  }
 
-    if (state.chatMode === 'mafia') {
-      socket.emit('mafiaChat', { message: msg });
-    } else {
-      socket.emit('chatMessage', { message: msg });
+  sendMafiaChat(socketId, message) {
+    const player = this.players.get(socketId);
+    if (!player || player.role !== ROLES.MAFIA) return { error: 'Not mafia' };
+    if (this.phase !== PHASES.NIGHT) return { error: 'Mafia chat only at night' };
+    return { ok: true, player };
+  }
+
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  _getAlivePlayers() {
+    return [...this.players.values()].filter(p => p.alive);
+  }
+
+  _resetNightActions() {
+    this.nightActions = {
+      mafiaTarget: null,
+      doctorTarget: null,
+      policeTarget: null,
+      mafiaVotes: {},
+    };
+  }
+
+  _addLog(entry) {
+    this.log.push({ time: Date.now(), text: entry });
+  }
+
+  _emit(event, data) {
+    if (this.onEvent) this.onEvent(event, data);
+  }
+
+  _emitTo(socketId, event, data) {
+    if (this.onEvent) this.onEvent(event, data, socketId);
+  }
+
+  _startTimer(duration, callback) {
+    this._clearTimer();
+    this._timerStart = Date.now();
+    this._timerDuration = duration;
+    this._timer = setTimeout(callback, duration);
+  }
+
+  _clearTimer() {
+    if (this._timer) {
+      clearTimeout(this._timer);
+      this._timer = null;
     }
   }
 
-  function _updateChatState() {
-    const phase = state.phase;
-    const myPlayer = state.players.find(p => p.id === state.myId);
-    const alive = myPlayer?.alive !== false;
-
-    if (!alive) {
-      UI.setChatEnabled(false, 'Dead players cannot chat');
-      return;
-    }
-    if (state.chatMode === 'mafia') {
-      const isNight = phase === 'night';
-      UI.setChatEnabled(isNight, isNight ? 'Mafia channel...' : 'Mafia chat only at night');
-      return;
-    }
-    const canChat = phase === 'day_discuss' || phase === 'day_vote' || phase === 'day_announce';
-    UI.setChatEnabled(canChat, canChat ? 'Type a message...' : 'Chat during day phases');
+  getTimerInfo() {
+    if (!this._timerStart) return null;
+    const elapsed = Date.now() - this._timerStart;
+    const remaining = Math.max(0, this._timerDuration - elapsed);
+    return { remaining, total: this._timerDuration };
   }
+}
 
-  // ── Render current phase ──────────────────────────────────────────────────
-
-  function _renderCurrentPhase() {
-    const myPlayer = state.players.find(p => p.id === state.myId);
-    if (myPlayer) state.isHost = myPlayer.isHost;
-
-    UI.renderPlayers(state.players, state.myId, state.myRole);
-
-    switch (state.phase) {
-      case 'lobby':
-        UI.renderLobby(state.roomId, state.players.length, state.settings.totalPlayers, state.isHost, state.settings);
-        UI.setChatEnabled(false, 'Chat during gameplay');
-        break;
-      // other phases are handled by socket events
-    }
-  }
-
-  // ── Public API ────────────────────────────────────────────────────────────
-
-  function showRestartModal() {
-    UI.showRestartModal(state.settings);
-  }
-
-  // ── Expose public methods ─────────────────────────────────────────────────
-
-  return {
-    init,
-    submitNightAction,
-    castVote,
-    showRestartModal,
-  };
-
-})();
-
-// ── Bootstrap ────────────────────────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', () => {
-  GameClient.init();
-});
+module.exports = { Game, PHASES, ROLES, TIMERS };
